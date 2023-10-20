@@ -10,7 +10,11 @@
 
 ### 架构
 
+首先，io_uring由两个环形数组+两个控制结构体组成。分别是提交数组(Submission)和完成数组(Completion)，两个控制结构体分别控制两个数组的读写指针索引，地址等。
 
+为什么用环形数组，因为节省内存，方便共享，类似的技术在epoll也存在；两个控制结构体存在内核空间，并且通过mmap映射到用户空间，这样避免了拷贝，也实现了更新可见，当然这会引来并发访问问题。
+
+![](./1.svg)
 
 ### 部分原理
 
@@ -29,5 +33,3 @@
 [io_uring 的接口与实现](https://www.skyzh.dev/blog/2021-06-14-deep-dive-io-uring/)
 
 [图解原理｜Linux I/O 神器之 io_uring](https://cloud.tencent.com/developer/article/2187655)
-
-
