@@ -1,16 +1,22 @@
-use std::{fs, io, os::fd::AsRawFd};
+use std::{fs::OpenOptions, io, os::{fd::AsRawFd, unix::prelude::OpenOptionsExt}};
 
-use io_uring::{opcode, types, IoUring};
+use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
 fn main() -> io::Result<()> {
-    let mut ring = IoUring::new(8)?;
+    let mut ring: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder()
+        .setup_iopoll()
+        .setup_sqpoll(500)
+        .build(1024)?;
 
-    let fd = fs::File::open("src/main.rs")?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(040000)
+        .open("/home/ubuntu/index.html")?;
     let mut buf = vec![0; 1024];
 
-    let read_e = opcode::Read::new(types::Fd(fd.as_raw_fd()), buf.as_mut_ptr(), buf.len() as _)
+    let read_e = opcode::Read::new(types::Fd(file.as_raw_fd()), buf.as_mut_ptr(), buf.len() as _)
         .build()
-        .user_data(0x42);
+        .user_data(1234);
 
     // Note that the developer needs to ensure
     // that the entry pushed into submission queue is valid (e.g. fd, buffer).
@@ -24,8 +30,7 @@ fn main() -> io::Result<()> {
 
     let cqe = ring.completion().next().expect("completion queue is empty");
 
-    assert_eq!(cqe.user_data(), 0x42);
-    assert!(cqe.result() >= 0, "read error: {}", cqe.result());
+    println!("{}", cqe.result());
 
     Ok(())
 }
