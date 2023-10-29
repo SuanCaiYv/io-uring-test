@@ -17,6 +17,8 @@ enum Token {
         read: bool,
         buf_idx: usize,
         offset: usize,
+        // size of bytes need to be sent
+        // or the size of the buffer can be filled.
         len: usize,
     },
     Read {
@@ -26,7 +28,9 @@ enum Token {
     Write {
         fd: RawFd,
         buf_idx: usize,
+        // offset + len should equal to the length of the buffer
         offset: usize,
+        // size of bytes need to be sent
         len: usize,
     },
 }
