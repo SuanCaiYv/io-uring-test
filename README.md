@@ -32,7 +32,7 @@
 - 返回。
 - App侧消费CQE，更新头指针。
 
-这里注意到，任务可能是由io-wq线程池去完成的，这是一个内核创建的轻量级线程池，用来处理任务，类似我们创建线程池处理文件阻塞调用，不过他做的不只是这些。
+这里注意到，任务可能是由io-wq线程池去完成的，这是一个内核创建的轻量级线程池，用来处理任务，类似我们创建线程池处理文件阻塞调用，不过它做的不只是这些。
 
 ### 部分原理
 
@@ -115,13 +115,294 @@ opcode很好理解，指出了此次任务的类型，比如读写文件，还�
 
 这里的io-wq并不是中断配置下的默认选择，相反可能直接立即执行，比如文件已经存在page cache中，此时直接在当前线程处理即可；这个细节比较复杂，涉及到具体的逻辑，后面会展开细说。
 
+另外，在构造时，默认CQ的大小是SQ的二倍，因为有时App侧拉取不及时会导致CQE堆积，所以App侧需要留意这件事。因为一般来说，App侧把SQE提交到队列就算完事了，之后就可以复用SQE，而Kernel或者IO_POLL执行SQE是需要时间的，所以可能导致App侧提交了两圈的SQE但是CQE未来得及收割。
+
 ### 小结
 
 io_uring的调用虽然只有两个，但是隐藏了复杂的分支流程，作为用户只要简单的使用即可，不过最好还是使用封装好的库，比如liburing，替我们做了很多不必要的封装。
 
 ## 使用
 
+在正式开始讨论用法之前，你必须保证有一个Linux环境，且内核版本(建议5.13以上)符合要求。如果你是Windows，考虑WSL2，如果你是Linux原生勇者，那可以直接进行下一步。
+
+如果你是macOS用户，也不是很难办，要么使用Docker或者OrbStack(推荐)搭建一个虚拟主机；要么使用Multipass搭建一个云服务器，我选择了后者，一方面因为性能更好，另一方面嘛，简单。
+
+Multipass是Ubuntu官方提供的云服务器环境搭建工具，你可以用它在macOS上快速搭建类似阿里云或者腾讯云这种的云服务器。如果你是Arm架构的macOS，搭建出来的也是Arm的Linux，我用起来是没什么问题，Linux本身对于Arm支持比WindowsOnArm强太多了；如果你是老的Intel，那自然是X64架构的。
+
+环境搭建完成，开始准备。
+
+如果你愿意大费周章的去自己做mmap，计算偏移量，设置构造参数，那可以直接使用io_uring_setup()和io_uring_enter()这两个系统调用。不过呢，对于C来说，有liburing可以直接使用，它封装了很多的细节。
+
+如果是Go语言，目前也有一些第三方的包可以调用，对于Java语言直接考虑使用Netty等网络库。
+
 最后我们来一些Rust中的使用，毕竟了解这个库一开始就是为了在Rust中使用。
+
+``` rust
+use std::{
+    collections::VecDeque,
+    io,
+    net::TcpListener,
+    os::fd::{AsRawFd, RawFd},
+    ptr,
+};
+
+use io_uring::{cqueue, opcode, squeue, types, IoUring};
+use slab::Slab;
+
+#[derive(Debug, Clone)]
+enum Token {
+    Accept,
+    Poll {
+        fd: RawFd,
+        read: bool,
+        buf_idx: usize,
+        offset: usize,
+        // size of bytes need to be sent
+        // or the size of the buffer can be filled.
+        len: usize,
+    },
+    Read {
+        fd: RawFd,
+        buf_idx: usize,
+    },
+    Write {
+        fd: RawFd,
+        buf_idx: usize,
+        // offset + len should equal to the length of the buffer
+        offset: usize,
+        // size of bytes need to be sent
+        len: usize,
+    },
+}
+
+fn main() -> io::Result<()> {
+    let mut backlog = VecDeque::new();
+    let mut token_vec = Slab::with_capacity(1024);
+    let mut buffer_pool = Vec::with_capacity(1024);
+    let mut buffer_alloc = Slab::with_capacity(1024);
+    let listener = TcpListener::bind(("0.0.0.0", 8190))?;
+
+    let mut ring: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder()
+        // .setup_iopoll()
+        .setup_sqpoll(500)
+        .build(1024)?;
+    let (submitter, mut sq, mut cq) = ring.split();
+
+    let accept_idx = token_vec.insert(Token::Accept);
+    let accept = opcode::Accept::new(
+        types::Fd(listener.as_raw_fd()),
+        ptr::null_mut(),
+        ptr::null_mut(),
+    )
+    .build()
+    .user_data(accept_idx as _);
+    unsafe {
+        _ = sq.push(&accept);
+    }
+    sq.sync();
+
+    loop {
+        match submitter.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("submit_and_wait error: {:?}", e);
+                break;
+            }
+        }
+        cq.sync();
+
+        loop {
+            if sq.is_full() {
+                _ = submitter.submit();
+            }
+            sq.sync();
+
+            match backlog.pop_front() {
+                Some(sqe) => unsafe {
+                    _ = sq.push(&sqe);
+                },
+                None => break,
+            }
+        }
+        unsafe {
+            _ = sq.push(&accept);
+        }
+        for cqe in &mut cq {
+            let res = cqe.result();
+            let token_idx = cqe.user_data() as usize;
+            if res < 0 {
+                eprintln!("cqe error: {:?}", io::Error::from_raw_os_error(-res));
+                continue;
+            }
+
+            let token = &mut token_vec[token_idx];
+            match *token {
+                Token::Accept => {
+                    println!("new connection");
+                    let (buf_idx, _buf) = match buffer_pool.pop() {
+                        Some(buf_index) => (buf_index, &mut buffer_alloc[buf_index]),
+                        None => {
+                            let buf = vec![0u8; 2048].into_boxed_slice();
+                            let buf_entry = buffer_alloc.vacant_entry();
+                            let buf_index = buf_entry.key();
+                            (buf_index, buf_entry.insert(buf))
+                        }
+                    };
+                    let token = token_vec.insert(Token::Poll {
+                        fd: res as _,
+                        read: true,
+                        buf_idx,
+                        offset: 0,
+                        len: 2048,
+                    });
+                    let poll = opcode::PollAdd::new(types::Fd(res as _), libc::POLLIN as _)
+                        .build()
+                        .user_data(token as _);
+                    unsafe {
+                        if sq.push(&poll).is_err() {
+                            backlog.push_back(poll);
+                        }
+                    }
+                }
+                Token::Poll {
+                    fd,
+                    read,
+                    buf_idx,
+                    offset,
+                    len,
+                } => {
+                    if read {
+                        *token = Token::Read { fd, buf_idx };
+                        let buf = &mut buffer_alloc[buf_idx][offset..];
+                        let read =
+                            opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), len as _)
+                                .build()
+                                .user_data(token_idx as _);
+                        unsafe {
+                            if sq.push(&read).is_err() {
+                                backlog.push_back(read);
+                            }
+                        }
+                    } else {
+                        *token = Token::Write {
+                            fd,
+                            buf_idx,
+                            offset,
+                            len,
+                        };
+                        let buf = &buffer_alloc[buf_idx][offset..];
+                        let write = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
+                            .build()
+                            .user_data(token_idx as _);
+                        unsafe {
+                            if sq.push(&write).is_err() {
+                                backlog.push_back(write);
+                            }
+                        }
+                    }
+                }
+                Token::Read { fd, buf_idx } => {
+                    if res == 0 {
+                        println!("connection closed");
+                        buffer_pool.push(buf_idx);
+                        token_vec.remove(token_idx);
+                        unsafe { libc::close(fd) };
+                        continue;
+                    }
+                    let len = res as usize;
+                    let buf = &buffer_alloc[buf_idx][..len];
+                    println!("server read: {}", String::from_utf8_lossy(buf).to_string());
+                    *token = Token::Poll {
+                        fd,
+                        read: false,
+                        buf_idx,
+                        offset: 0,
+                        len,
+                    };
+                    let poll = opcode::PollAdd::new(types::Fd(fd), libc::POLLOUT as _)
+                        .build()
+                        .user_data(token_idx as _);
+                    unsafe {
+                        if sq.push(&poll).is_err() {
+                            backlog.push_back(poll);
+                        }
+                    }
+                }
+                Token::Write {
+                    fd,
+                    buf_idx,
+                    offset,
+                    len,
+                } => {
+                    if res == 0 {
+                        println!("connection closed");
+                        buffer_pool.push(buf_idx);
+                        token_vec.remove(token_idx);
+                        unsafe { libc::close(fd) };
+                        continue;
+                    }
+                    let sent = res as usize;
+                    if sent < len {
+                        *token = Token::Poll {
+                            fd,
+                            read: false,
+                            buf_idx,
+                            offset: offset + sent,
+                            len: len - sent,
+                        };
+                        let poll = opcode::PollAdd::new(types::Fd(fd), libc::POLLOUT as _)
+                            .build()
+                            .user_data(token_idx as _);
+                        unsafe {
+                            if sq.push(&poll).is_err() {
+                                backlog.push_back(poll);
+                            }
+                        }
+                    } else {
+                        *token = Token::Poll {
+                            fd,
+                            read: true,
+                            buf_idx,
+                            offset: 0,
+                            len: 2048,
+                        };
+                        let poll = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _)
+                            .build()
+                            .user_data(token_idx as _);
+                        unsafe {
+                            if sq.push(&poll).is_err() {
+                                backlog.push_back(poll);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+```
+
+用到的依赖：
+
+``` toml
+[dependencies]
+io-uring = "0.6.2"
+slab = "0.4.9"
+libc = "0.2.149"
+```
+
+这里给出了一个“简单的”Tcp Echo服务器。如你所见，写了很多，而仅仅做到了Echo功能。
+
+这里我们选用Tokio封装的io-uring，查看源码就知道Tokio做的封装很纯(简)粹(陋)，Rust中还有很多针对io-uring的封装，可以根据自己的爱好选用。
+
+另外一提，Tokio有一个异步化的io-uring库，如果你喜欢async可以考虑，或者自己封装裸操作，比如定义几个结构体实现Future之类的。
+
+上述代码有一个有趣的backlog，它用于处理环满的时候，把额外的SQE保存下来，后面循环时再提交。之后就是简单易懂的循环，从Accept->新连接到达->PollAdd_Read->可读->Recv->PollAdd_Write->可写->Send->循环往复。
+
+Tokio的思路是使用一个枚举来保存user_data字段，里面包含此次操作完成之后需要进行的处理，这是一种状态机思想。
 
 ## 参考
 
