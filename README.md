@@ -140,7 +140,7 @@ io-wq对于无限时间任务的处理，比较“智能”，它会先判断是
 
 一个任务提交到io_uring，会先尝试走non-blocking，如果得不到结果再入池，但是你可以指明这个任务不要进行non-blocking尝试，直接入池，比如文件操作。但可能会很低效，如果你没有把握就不要开启这个标识。
 
-其实这里有一个模糊点，Linux的文件IO天然不支持non-blocking，所以对文件操作进行就绪判断是无意义的，但是对于网络IO直接入池又是低效的，因为网络IO支持non-blocking。我猜测这是早期的设计问题。因为早期并没有内部poll机制去处理non-blocking的网络IO，而是都扔到无限时间池处理的，所以这个取消尝试的标识可能是用于这里的。
+其实这里有一个模糊点，Linux的文件IO天然不支持non-blocking，所以对文件操作进行就绪判断是无意义的，但是对于网络IO直接入池又是低效的，因为网络IO支持non-blocking。我猜测这是早期的设计问题。因为早期并没有内部poll机制去处理non-blocking的网络IO，而是都扔到无限时间池处理的，所以这个取消尝试的标识可能是用于这里的。因为早期引入有限时间和无限时间的队列就是因为那时网络IO是直接提交的，和文件IO一样，但是避免阻塞到文件IO(网络不知何时有数据或者可写)操作，所以开辟了默认池更大的线程池给网络IO用。
 
 之后是IOPOLL的设置，首先SQE加入到SQ环不会提交给内核，因为内核感知不到来新单了，需要调用`io_uring_enter()`去告诉内核来订单了；如果设置了IOPOLL，会在调用`enter`提交SQE时loop住，即忙轮询，轮询IO就绪，有些外设或者技术处理IO很快，比提交中断唤醒这一套还快，所以此时忙轮询是有意义的。
 
@@ -458,3 +458,7 @@ Tokio的思路是使用一个枚举来保存user_data字段，里面包含此次
 [io_uring 的接口与实现](https://www.skyzh.dev/blog/2021-06-14-deep-dive-io-uring/)
 
 [图解原理｜Linux I/O 神器之 io_uring](https://cloud.tencent.com/developer/article/2187655)
+
+[io_uring 使用教程| io_uring 完全指南 | io_uring 实践指导 | io_uring 资料参考](https://blog.csdn.net/u010180372/article/details/123931574)
+
+[Missing Manuals - io_uring worker pool](https://blog.cloudflare.com/missing-manuals-io_uring-worker-pool/)
